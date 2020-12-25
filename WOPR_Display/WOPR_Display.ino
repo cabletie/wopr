@@ -1,106 +1,135 @@
-/***************************************************
+/*************************************************** 
   War Games - W.O.P.R. Missile Codes
-  2020 UNexpected Maker
+  2020 Unexpected Maker
   Licensed under MIT Open Source
 
   This code is designed specifically to run on an ESP32. It uses features only
   available on the ESP32 like RMT and ledcSetup.
 
   W.O.P.R is available on tindie
-
   https://www.tindie.com/products/seonr/wopr-missile-launch-code-display-kit/
   
-  Wired up for use with the TinyPICO ESP32 Development Board & TinyPICO Audio Shield
-  
-  All products also available on my own store
-  
-  http://unexpectedmaker.com/shop/
+  Wired up for use with the TinyPICO ESP32 Development Board
+  https://www.tinypico.com/shop/tinypico
 
+  And the TinyPICO Audio Shield
+  https://www.tinypico.com/shop/tinypico-mzffe-zatnr
+ ****************************************************
+ As modified by @CableTie
+  - Added Setup menu to set:
+    o DST,
+    o TimeZone,
+    o LED Brightness,
+    o Default menu,
+    o Delay before default menu selection is automatically entered
+    o Clock digit separator
+  - Added savings settings to flash using prefs from EEPROM Module
+  - Message when connecting to WiFi
  ****************************************************/
-
-// Un-comment this line if using the new HAXORZ PCB revision
-#define HAXORZ_EDITION 1
-
-#include <Adafruit_GFX.h> // From Library Manager
+// #define ARDUINO 100
+// #include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>         // From Library Manager
 #include "Adafruit_LEDBackpack.h" // From Library Manager
-#include "OneButton.h" // From Library Manager
-#include "ESPFlash_Mod.h"
+#include "OneButton.h"            // From Library Manager
 #include <WiFi.h>
-#include "time.h"
+#include <time.h>
 #include "secret.h"
 #include "rmt.h"
+#include "ESP32TimerInterrupt.h"
+#include <Preferences.h>
 
 // Defines
 #ifndef _BV
-#define _BV(bit) (1<<(bit))
+#define _BV(bit) (1 << (bit))
 #endif
 
-#define ELEMENTS(x)   (sizeof(x) / sizeof(x[0]))
+// Debug
+#define DEBUG
 
-#define BUT1 14 // front lef button
-#define BUT2 15 // front right button
-
-#ifdef HAXORZ_EDITION
-#define BUT3 32 // back top button
-#define BUT4 33 // back bottom button
-#endif
-
+#define BUT1 14   // front left button
+#define BUT2 15   // front right button
 #define RGBLED 27 // RGB LED Strip
-#define DAC 25 // RGB LED Strip
-
-// User settings
-// User settable countdown (seonds) for auto clock mode when in menu
-// Set 0 to be off
-uint8_t settings_clockCountdownTime = 60;
-// User settable GMT value
-int settings_GMT = 0;
-// User settable Daylight Savings state
-bool settings_DST = false;
-// User settable display brightness
-uint8_t settings_displayBrightness = 15;
-// User settable clock separator
-uint8_t settings_separator = 0; // 0 is " ", 1 is "-", 2 is "_"
-
+#define DAC 25    // RGB LED Strip
+// Seconds to milliseconds
+#define S2MS(s) (1000 * s)
 
 // NTP Wifi Time
-const char* ntpServer = "pool.ntp.org";
-const int   daylightOffset_sec = 3600;
-bool didChangeClockSettings = false;
-bool hasWiFi = false;
+#define TZ_DEFAULT 10
+#define DST_DEFAULT 0
+const char *ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 3600 * TZ_DEFAULT;
+const int daylightOffset_sec = 3600 * DST_DEFAULT;
 
-//// Program & Menu state
-String clockSeparators [] = {" ", "-", "_"};
-String stateStrings[] = {"MENU", "RUNNING", "SETTINGS"};
-String menuStrings[] = {"MODE MOVIE", "MODE RANDOM", "MODE MESSAGE", "MODE CLOCK", "SETTINGS"};
-String settingsStrings[] = {"GMT ", "DST ", "BRIGHT ", "CLK CNT ", "CLK SEP "};
+// Program & Menu state
+uint8_t currentState = 0; // 0 - menu, 1 - running, 2 - Setup
+char const *const stateNames[] = {"MENU", "RUN", "SET"};
+#define MAXSTATE 2
+#define STATEMENU 0
+#define STATERUN 1
+#define STATESET 2
 
-enum states {
-  MENU = 0,
-  RUNNING = 1,
-  SET = 2,
-} currentState;
+uint8_t currentMode = 0;    // 0 - movie simulation, 1 - random sequence, 2 - message, 3 - clock, 4 - Ticker, 5 - Setup
+long menuTimeoutMillis = 0; // Tracks when the menu mode should be auto changed to clock mode
+char const *const modeNames[] = {"MOVIE", "RANDOM", "MESSAGE", "CLOCK", "TICKER", "SETUP"};
+#define MAXMODE 5
+#define MODEMOVIE 0
+#define MODERANDOM 1
+#define MODEMESSAGE 2
+#define MODECLOCK 3
+#define MODETICKER 4
+#define MODESETUP 5
 
-enum modes {
-  MOVIE = 0,
-  RANDOM = 1,
-  MESSAGE = 2,
-  CLOCK = 3,
-  SETTINGS = 4,
-} currentMode;
+/******************************************************
+Settings
+Setting types
+Integer (min, max) - e.g. menuTimeout, defaultMode
+Boolean - e.g. DST
+Character (min, max) - e.g. Time Separator
+*******************************************************/
 
-enum settings {
-  SET_GMT = 0,
-  SET_DST = 1,
-  SET_BRIGHT = 2,
-  SET_CLOCK = 3,
-  SET_SEP = 4,
-} currentSetting;
+// Timer to flash setting value part of display on LEDs
+ESP32Timer ledFlashTimer(0);
+bool ledFlash = true;
 
+#define MENU_TIMEOUT_DEFAULT 10
+#define TIMESEPARATOR '\x17'
+#define MAXBRIGHTNESS 15
+
+// EEPROM Module
+Preferences prefs;
+// How long before menu is exited to go to default mode
+uint8_t menuTimeout; // Seconds
+// Whether daylight savings is on or off
+uint8_t daylightSavings;
+// Timezone offset in integer hours
+int8_t timeZone;
+// Character to use between time digits
+char timeSeparator; // Currently requires mods to the Adafruit font library
+// Mode to exit to menu to
+uint8_t defaultMode;
+// Brightness 0-15
+uint8_t ledBrightness; // LED brightness setting 0-15
+
+// Settings names
+char const *const settingNames[] = {"TIMEOUT", "DST", "DELIM", "MODE", "BRIGHT", "TZONE"};
+
+// Setting enum thingy
+#define MAXSETTING 5
+#define SETTIMEOUT 0
+#define SETDST 1
+#define SETDELIM 2
+#define SETDEFAULT 3
+#define SETBRIGHT 4
+#define SETTZONE 5
+
+// Which setting we are setting
+uint8_t currentSetting = 0;
 
 /* Code cracking stuff
-   Though this works really well, there are probably much nicer and cleaner
-   ways of doing this, so feel free to improve it and make a pull request!
-*/
+ * Though this works really well, there are probably much nicer and cleaner 
+ * ways of doing this, so feel free to improve it and make a pull request!
+ */
 uint8_t counter = 0;
 unsigned long nextTick = 0;
 unsigned long nextSolve = 0;
@@ -125,19 +154,15 @@ int resolution = 8;
 unsigned long nextRGB = 0;
 long nextPixelHue = 0;
 uint32_t defcon_colors[] = {
-  Color(255, 255, 255),
-  Color(255, 0, 0),
-  Color(255, 255, 0),
-  Color(0, 255, 0),
-  Color(0, 0, 255),
+    Color(255, 255, 255),
+    Color(255, 0, 0),
+    Color(255, 255, 0),
+    Color(0, 255, 0),
+    Color(0, 0, 255),
 };
 
-// General stuff
-unsigned long countdownToClock = 0;
-
-
 // Setup 3 AlphaNumeric displays (4 digits per display)
-Adafruit_AlphaNum4 matrix[3] = { Adafruit_AlphaNum4(), Adafruit_AlphaNum4(), Adafruit_AlphaNum4() };
+Adafruit_AlphaNum4 matrix[3] = {Adafruit_AlphaNum4(), Adafruit_AlphaNum4(), Adafruit_AlphaNum4()};
 
 char displaybuffer[12] = {'-', '-', '-', ' ', '-', '-', '-', '-', ' ', '-', '-', '-'};
 
@@ -154,39 +179,63 @@ uint8_t code_solve_order_random[12] = {99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 9
 // Initialise the buttons using OneButton library
 OneButton Button1(BUT1, false);
 OneButton Button2(BUT2, false);
-#ifdef HAXORZ_EDITION
-OneButton Button3(BUT3, false);
-OneButton Button4(BUT4, false);
-#endif
 
 void setup()
 {
   Serial.begin(115200);
-  delay(100);
-  Serial.println("");
   Serial.println("Wargames Missile Codes");
 
+  Serial.print("Arduino v");
+  Serial.println(ARDUINO);
+
+  // Start EEPROM and load parameters
+  prefs.begin("settings"); // use "settings" namespace
+
+  // How long before menu is exited to go to default mode
+  menuTimeout = prefs.getUChar("Timeout", MENU_TIMEOUT_DEFAULT); // Seconds
+  Serial.printf("Loaded Timout: %d\n", menuTimeout);
+  // Whether daylight savings is on or off
+  daylightSavings = prefs.getUChar("DST", DST_DEFAULT);
+  Serial.printf("Loaded DST: %s\n", daylightSavings ? "On" : "Off");
+  // Timezone
+  timeZone = prefs.getChar("TZone", TZ_DEFAULT);
+  Serial.printf("Loaded TZone: %d\n", timeZone);
+  // Character to use between time digits
+  // Currently requires mods to the Adafruit font library
+  timeSeparator = prefs.getUChar("Delim", TIMESEPARATOR);
+  Serial.printf("Loaded Delimiter: 0x%02X\n", timeSeparator);
+  // Mode to exit to menu to
+  defaultMode = prefs.getUChar("Dflt", MODECLOCK);
+  Serial.printf("Loaded Default Mode: %s\n", modeNames[defaultMode]);
+  // LED brightness setting 0-15
+  ledBrightness = prefs.getUChar("Bright", MAXBRIGHTNESS);
+  Serial.printf("Loaded LED Brightness: %d\n", ledBrightness);
+  setLedBrightness(ledBrightness);
+
+  // Start LED flash timer
+  // Not sure if it's OK to leave this running ...
+  // Interval in microsecs
+  if (ledFlashTimer.attachInterruptInterval(500 * 1000, toggleLedFlash))
+    Serial.println("Starting ledFlashTimer OK, millis() = " + String(millis()));
+  else
+    Serial.println("Can't set ledFlashTimer. Select another freq. or timer");
 
   // Setup RMT RGB strip
-  while ( !RGB_Setup(RGBLED, 50) )
+  while (!RGB_Setup(RGBLED, 50))
   {
     // This is not good...
-    delay(10);
+    delay(1000);
   }
 
   // Attatch button IO for OneButton
   Button1.attachClick(BUT1Press);
-  Button1.attachDuringLongPress(BUT1_SaveSettings);
+  Button2.attachLongPressStart(BUT2LongPress);
   Button2.attachClick(BUT2Press);
-#ifdef HAXORZ_EDITION
-  Button3.attachClick(BUT3Press);
-  Button4.attachClick(BUT4Press);
-#endif
 
   // Initialise each of the HT16K33 LED Drivers
-  matrix[0].begin(0x70);  // pass in the address  0x70 == 1, 0x72 == 2, 0x74 == 3
-  matrix[1].begin(0x72);  // pass in the address  0x70 == 1, 0x72 == 2, 0x74 == 3
-  matrix[2].begin(0x74);  // pass in the address  0x70 == 1, 0x72 == 2, 0x74 == 3
+  matrix[0].begin(0x70); // pass in the address  0x70 == 1, 0x72 == 2, 0x74 == 3
+  matrix[1].begin(0x72); // pass in the address  0x70 == 1, 0x72 == 2, 0x74 == 3
+  matrix[2].begin(0x74); // pass in the address  0x70 == 1, 0x72 == 2, 0x74 == 3
 
   // Reset the code variables
   ResetCode();
@@ -199,393 +248,376 @@ void setup()
   ledcSetup(channel, freq, resolution);
   ledcAttachPin(DAC, channel);
 
-
-  
-  // Load the user settings. If this fails, defaults are created.
-  DisplayText( "FRMAT SPIFFS" );
-  loadSettings();
-  
-  
-  SetDisplayBrightness(settings_displayBrightness);
-
   /* Initialise WiFi to get the current time.
-     Once the time is obtained, WiFi is disconnected and the internal
-     ESP32 RTC is used to keep the time
-     Make sure you have set your SSID and Password in secret.h
-  */
-
+   * Once the time is obtained, WiFi is disconnected and the internal 
+   * ESP32 RTC is used to keep the time
+   * Make sure you have set your SSID and Password in secret.h
+   */
+  DisplayText("Trying WiFi");
   StartWifi();
 
-  // User settable countdown from main menu to go into clock if no user interaction
-  // Has happened. settings_clockCountdownTime is in seconds and we want milliseconds
+  // Display MENU and Initialise timeout
+  DisplayText("MENU");
+  menuTimeoutMillis = millis() + S2MS(menuTimeout);
+}
 
-  countdownToClock = millis() + settings_clockCountdownTime * 1000;
+// Timer callback to flash settings number
+void toggleLedFlash()
+{
+  ledFlash = !ledFlash;
+}
 
-  // Display MENU
-  DisplayText( "MENU" );
+String GetCurrentSettingValueString()
+{
+  switch (currentSetting)
+  {
+  case SETBRIGHT:
+    return String(ledBrightness);
+    break;
+  case SETDEFAULT:
+    return modeNames[defaultMode];
+    break;
+  case SETDELIM:
+    return String(timeSeparator);
+    break;
+  case SETDST:
+    return String(daylightSavings);
+    break;
+  case SETTIMEOUT:
+    return String(menuTimeout);
+    break;
+  case SETTZONE:
+    return String(timeZone);
+    break;
+
+  default:
+    return "Error";
+    break;
+  }
+}
+
+void setLedBrightness(uint8_t b)
+{
+  for (int x = 0; x < 3; x++)
+    matrix[x].setBrightness(ledBrightness);
+}
+
+void incrementSetting()
+{
+  switch (currentSetting)
+  {
+  case SETBRIGHT:
+    ledBrightness++;
+    if (ledBrightness > MAXBRIGHTNESS)
+      ledBrightness = MAXBRIGHTNESS;
+    setLedBrightness(ledBrightness);
+    break;
+  case SETDEFAULT:
+    defaultMode++;
+    if (defaultMode > MAXMODE)
+      defaultMode = 0;
+    break;
+  case SETDELIM:
+    timeSeparator++;
+    if (timeSeparator > 127)
+      timeSeparator = 0;
+    break;
+  case SETDST:
+    daylightSavings = daylightSavings==1?0:1;
+    break;
+  case SETTIMEOUT:
+    menuTimeout++;
+    if (menuTimeout > 240)
+      menuTimeout = 3;
+    break;
+  case SETTZONE:
+    timeZone++;
+    if (timeZone > 12)
+      timeZone = -12;
+    break;
+
+  default:
+    break;
+  }
+}
+
+void decrementSetting()
+{
+  switch (currentSetting)
+  {
+  case SETBRIGHT:
+    if (ledBrightness > 0)
+      ledBrightness--;
+    setLedBrightness(ledBrightness);
+    break;
+  case SETDEFAULT:
+    if (defaultMode == 0)
+      defaultMode = MAXMODE;
+    else
+      defaultMode--;
+    break;
+  case SETDELIM:
+    if (timeSeparator == 0)
+      timeSeparator = 127;
+    else
+      timeSeparator--;
+    break;
+  case SETDST:
+    daylightSavings = daylightSavings==1?0:1;
+    break;
+  case SETTIMEOUT:
+    if (menuTimeout == 3)
+      menuTimeout = 240;
+    else
+      menuTimeout--;
+    break;
+  case SETTZONE:
+    timeZone--;
+    if (timeZone < (-12))
+      timeZone = 12;
+    break;
+
+  default:
+    break;
+  }
 }
 
 void StartWifi()
 {
-
-  if ( ssid == "PUT SSID HERE" )
+  //connect to WiFi
+  Serial.printf("Connecting to %s ", ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED)
   {
-    DisplayText( "SSID NOT SET" );
-    RGB_SetColor_ALL( Color(255, 0, 0) );
-    hasWiFi = false;
-    delay(2000);
+    delay(500);
+    Serial.print(".");
   }
-  else if ( password == "PUT PASSWORD HERE" )
+  Serial.println(" CONNECTED");
+
+  //init and get the time
+  Serial.printf("calling configTime(%d,%d,%s)",timeZone * 3600 + daylightSavings * 3600, 0, ntpServer);
+  configTime(timeZone * 3600 + daylightSavings * 3600, 0, ntpServer);
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo))
   {
-    DisplayText( "PASS NOT SET" );
-    RGB_SetColor_ALL( Color(255, 0, 0) );
-    hasWiFi = false;
-    delay(2000);
+    Serial.println("Failed to obtain time");
+    return;
   }
-  else
-  {
-    DisplayText( "TRYING WiFi" );
+  Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
 
-    //connect to WiFi
-    int wifi_counter = 100;
-    Serial.printf("Connecting to %s ", ssid);
-    WiFi.begin(ssid, password);
-    while (WiFi.status() != WL_CONNECTED && wifi_counter > 0)
-    {
-      delay(100);
-      RGB_Rainbow(0);
-      wifi_counter--;
-      Serial.print(".");
-    }
-
-    if (WiFi.status() != WL_CONNECTED && wifi_counter == 0)
-    {
-      DisplayText( "WiFi FAILED" );
-      RGB_SetColor_ALL( Color(255, 0, 0) );
-      hasWiFi = false;
-      //while(1) {delay(1000);}
-      delay(3000);
-    }
-    else
-    {
-      Serial.println(" CONNECTED");
-      DisplayText( "WiFi GOOD" );
-      RGB_SetColor_ALL( Color(0, 255, 0) );
-
-      hasWiFi = true;
-
-      delay(500);
-
-      //init and get the time
-
-      configTime(settings_GMT * 3600, settings_DST ? daylightOffset_sec : 0, ntpServer);
-
-      struct tm timeinfo;
-      if (!getLocalTime(&timeinfo)) {
-        Serial.println("Failed to obtain time");
-        DisplayText( "Time FAILED" );
-        RGB_SetColor_ALL( Color(255, 0, 0) );
-      }
-      else
-      {
-        Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
-
-        //disconnect WiFi as it's no longer needed
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_OFF);
-
-        DisplayText( "Time Set OK" );
-        RGB_SetColor_ALL( Color(0, 0, 255) );
-      }
-
-      delay(1000);
-    }
-  }
+  //disconnect WiFi as it's no longer needed
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
 }
 
 // Button press code her
 long nextButtonPress = 0;
 
-// This is triggered from a long press on button 1
-void BUT1_SaveSettings()
-{
-  if ( currentState == SET && currentMode == SETTINGS )
-  {
-    Serial.println("SAAAAAVE!");
-    DisplayText( "SAVING..." );
-    saveSettings();
-    delay(500);
-
-    if ( didChangeClockSettings )
-    {
-      // We need to start the MCU now to kick in any time changes
-      // As they happen during startup when wifi is connected
-      ESP.restart();
-    }
-    else
-    {
-      // Reset the menu state after save
-      currentState = MENU;
-      currentSetting = SET_GMT;
-      countdownToClock = millis() + settings_clockCountdownTime * 1000;
-      DisplayText( "SETTINGS" );
-    }
-  }
-}
-
 void BUT1Press()
 {
+  // String for sending to LED Display
+  char ledString[13];
+
   // Only allow a button press every 10ms
-  if ( nextButtonPress < millis() )
+  if (nextButtonPress < millis())
   {
     nextButtonPress = millis() + 10;
 
     // If we are not in the menu, cancel the current state and show the menu
-    if ( currentState == RUNNING )
+    if (currentState == STATERUN)
     {
-      currentState = MENU;
+      if (currentMode == MODESETUP)
+      {
+        // Increment the setting value
+        incrementSetting();
+      }
+      else
+      {
+        currentState = STATEMENU; // Jump out to menu mode
+        currentMode = MODEMOVIE;  // Always start from the first mode item in the list
 
-      DisplayText( "MENU" );
+        DisplayText("MENU");
+        menuTimeoutMillis = millis() + S2MS(menuTimeout);
 
-      //Shutdown the audio is it's beeping
-      ledcWriteTone(channel, 0);
-      beeping = false;
+        //Shutdown the audio if it's beeping
+        ledcWriteTone(channel, 0);
+        beeping = false;
+      }
     }
-    else if ( currentState == MENU )
+    else if (currentState == STATESET)
     {
+      currentSetting++;
+      if (currentSetting > MAXSETTING)
+        currentSetting = 0;
+      Serial.printf("SET %s (%s)\n", String(settingNames[currentSetting]), GetCurrentSettingValueString());
+      sprintf(ledString, "%s %s", settingNames[currentSetting], GetCurrentSettingValueString());
+      Serial.print("LED String: ");
+      Serial.println(ledString);
+      DisplayText(ledString);
+    }
+    else
+    {
+      // Top level menu
+      // Reset menuTimeout watchdog
+      menuTimeoutMillis = millis() + S2MS(menuTimeout);
+
       // Update the current program state and display it on the menu
-      int nextMode = (int)currentMode + 1;
-      if ( nextMode == ELEMENTS(menuStrings) )
-        nextMode = 0;
-      currentMode = (modes)nextMode;
+      if (currentMode == MAXMODE)
+        currentMode = 0;
+      else
+        currentMode++;
 
-      DisplayText( menuStrings[(int)currentMode] );
-    }
-    else if ( currentState == SET )
-    {
-      // Update the current settings state and display it on the menu
-      int nextMode = (int)currentSetting + 1;
-      if ( nextMode == ELEMENTS(settingsStrings) )
-        nextMode = 0;
-      currentSetting = (settings)nextMode;
-
-      ShowSettings();
+      sprintf(ledString, "MODE %s", modeNames[currentMode]);
+      DisplayText(ledString);
     }
 
-    // Reset the clock countdown now that we are back in the menu
-    // settings_clockCountdownTime is in seconds, we need milliseconds
-    countdownToClock = millis() + settings_clockCountdownTime * 1000;
-
-    Serial.print("Current State: ");
-    Serial.print( stateStrings[(int)currentState] );
+    Serial.printf("Current State: %s (%d)\n", stateNames[currentState], currentState);
 
     Serial.print("  Current Mode: ");
-    Serial.println( menuStrings[(int)currentMode] );
+    Serial.print(modeNames[currentMode]);
+    Serial.printf("(%d)\n", currentMode);
+    if (currentMode == MODESETUP)
+    {
+      Serial.printf(" Current Setting: %s (%s)", settingNames[currentSetting], GetCurrentSettingValueString());
+    }
+    Serial.println();
+  }
+}
+
+void setupCurrentMode()
+{
+  char settingString[12];
+
+  // Set the defcon state if we are not the clock or setting up, otherwise clear the RGB
+  switch (currentMode)
+  {
+  case MODECLOCK:
+    RGB_Clear(true);
+    currentState = STATERUN;
+    break;
+  case MODESETUP:
+    RGB_Clear(true);
+    currentState = STATESET;
+    sprintf(settingString, "%s %s", settingNames[currentSetting], GetCurrentSettingValueString());
+    DisplayText(settingString);
+    break;
+  case MODEMOVIE:
+  case MODERANDOM:
+  case MODEMESSAGE:
+  case MODETICKER:
+    RGB_SetDefcon(5, true);
+    ResetCode();
+    Clear();
+    currentState = STATERUN;
+    break;
+  default:
+    currentState = STATEMENU;
+    break;
   }
 }
 
 void BUT2Press()
 {
   // Only allow a button press every 10ms
-  if ( nextButtonPress < millis() )
+  if (nextButtonPress < millis())
   {
     nextButtonPress = millis() + 10;
 
+    if (currentState == STATESET)
+    {
+      currentState = STATERUN;
+    }
+    else if (currentState == STATERUN)
+    {
+      if (currentMode == MODESETUP)
+        decrementSetting();
+    }
     // If in the menu, start whatever menu option we are in
-    if ( currentState == MENU )
+    else if (currentState == STATEMENU)
     {
-      // Check to see what mode we are in, because not all modes start the
-      // code sequence is
-      if ( currentMode == SETTINGS )
-      {
-        currentState = SET;
-        Serial.println("Going into settings mode");
-        ShowSettings();
-      }
-      else
-      {
-        // Set the defcon state if we are not the clock, otherwise clear the RGB
-        if ( currentMode != CLOCK )
-          RGB_SetDefcon(5, true);
-        else
-          RGB_Clear(true);
-
-        ResetCode();
-        Clear();
-        currentState = RUNNING;
-      }
-    }
-    else if ( currentState == SET )
-    {
-      // If in the settings, cycle the setting for whatever setting we are on
-      if ( currentMode == SETTINGS )
-      {
-        UpdateSetting(1);
-      }
+      setupCurrentMode();
     }
   }
 
-  Serial.print("Current State: ");
-  Serial.println( stateStrings[(int)currentState] );
+  Serial.printf("Current State: %s (%d)\n", stateNames[currentState], currentState);
+
+  Serial.print("  Current Mode: ");
+  Serial.print(modeNames[currentMode]);
+  if (currentMode == MODESETUP)
+  {
+    Serial.printf(" Current Setting: %s (%s)", settingNames[currentSetting], GetCurrentSettingValueString());
+  }
+  Serial.println();
 }
 
-#ifdef HAXORZ_EDITION
-
-void BUT3Press()
+void BUT2LongPress()
 {
-  // Only allow a button press every 10ms
-  if ( nextButtonPress < millis() )
-  {
-    nextButtonPress = millis() + 10;
+  // Finish setting state
+  if ((currentState == STATERUN) & (currentMode == MODESETUP))
+    currentState = STATEMENU;
+  Serial.println("Long Press Button 2 - exit to Menu");
 
-    // If in the settings, cycle the setting for whatever menu option we are in
-    if ( currentState == SET && currentMode == SETTINGS )
-    {
-      UpdateSetting(1);
-    }
-  }
-}
+  // Apply settings
+  Serial.printf("calling configTime(%d,%d,%s)",timeZone * 3600 + daylightSavings * 3600, 0, ntpServer);
+  configTime(timeZone * 3600 + daylightSavings * 3600, 0, ntpServer);
 
-void BUT4Press()
-{
-  // Only allow a button press every 10ms
-  if ( nextButtonPress < millis() )
-  {
-    nextButtonPress = millis() + 10;
+  // Save settings to NVRAM if they have changed
+  // Temp vars to compare saved with current
+  uint8_t _menuTimeout;
+  boolean _daylightSavings;
+  int8_t _timeZone;
+  char _timeSeparator;
+  uint8_t _defaultMode;
+  uint8_t _ledBrightness;
 
-    // If in the settings, cycle the setting for whatever menu option we are in
-    if ( currentState == SET && currentMode == SETTINGS )
-    {
-      UpdateSetting(-1);
-    }
-  }
-}
-
-
-#endif
-
-// Cycle the setting for whatever current setting we are changing
-void UpdateSetting( int dir )
-{
-  if ( currentSetting == SET_GMT )
-  {
-    settings_GMT += dir;
-    if ( settings_GMT > 14 )
-      settings_GMT = -12;
-    else if ( settings_GMT < -12 )
-      settings_GMT = 14;
-
-    didChangeClockSettings = true;
-  }
-  else if ( currentSetting == SET_DST )
-  {
-    settings_DST = !settings_DST;
-    didChangeClockSettings = true;
-  }
-  else if ( currentSetting == SET_BRIGHT )
-  {
-    settings_displayBrightness += dir;
-    if ( settings_displayBrightness > 15 )
-      settings_displayBrightness = 0;
-    else if ( settings_displayBrightness < 0 )
-      settings_displayBrightness = 15;
-
-    SetDisplayBrightness(settings_displayBrightness);
-  }
-  else if ( currentSetting == SET_CLOCK )
-  {
-    settings_clockCountdownTime += dir * 10; // Larger increments for quicker change
-    if ( settings_clockCountdownTime > 60 )
-      settings_clockCountdownTime = 0;
-    else if ( settings_clockCountdownTime < 0 )
-      settings_clockCountdownTime = 60;
-
-    countdownToClock = millis() + settings_clockCountdownTime * 1000;
-  }
-  else if ( currentSetting == SET_SEP )
-  {
-    settings_separator += dir;
-    if ( settings_separator == 3)
-      settings_separator = 0;
-    else if ( settings_separator < 0 )
-      settings_separator = 2;
-  }
-
-  // Update the display showing whatever the new current setting is
-  ShowSettings();
-}
-
-void ShowSettings()
-{
-  Serial.print("current setting: ");
-  Serial.println(currentSetting);
-
-  String val = "";
-
-  if ( currentSetting == SET_GMT )
-    val = String(settings_GMT);
-  else if ( currentSetting == SET_DST )
-    val = settings_DST ? "ON" : "OFF";
-  else if ( currentSetting == SET_BRIGHT )
-    val = String(settings_displayBrightness);
-  else if ( currentSetting == SET_CLOCK )
-  {
-    if ( settings_clockCountdownTime > 0 )
-      val = String(settings_clockCountdownTime);
-    else
-      val = "OFF";
-  }
-  else if ( currentSetting == SET_SEP)
-  {
-    if ( settings_separator == 0 )
-      val = "SPC";
-    else
-      val = clockSeparators[settings_separator];
-  }
-
-  DisplayText( settingsStrings[(int)currentSetting] + val);
-}
-
-// Adjust the LED display brightness: Range is 0-15
-void SetDisplayBrightness( int val )
-{
-  for (int x = 0; x < 3; x++)
-    matrix[x].setBrightness(val);
+  if (prefs.getUChar("Timeout", MENU_TIMEOUT_DEFAULT) != menuTimeout)
+    prefs.putUChar("Timeout", menuTimeout);
+  if (prefs.getBool("DST", DST_DEFAULT) != daylightSavings)
+    prefs.putUChar("DST", daylightSavings);
+  if (prefs.getChar("TZone", TZ_DEFAULT) != timeZone)
+    prefs.putUChar("TZone", timeZone);
+  if (prefs.getUChar("Delim", TIMESEPARATOR) != timeSeparator)
+    prefs.putUChar("Delim", timeSeparator);
+  if (prefs.getUChar("Dflt", MODECLOCK) != defaultMode)
+    prefs.putUChar("Dflt", defaultMode);
+  if (prefs.getUChar("Bright", MAXBRIGHTNESS) != ledBrightness)
+    prefs.putUChar("Bright", ledBrightness);
 }
 
 // Take the time data from the RTC and format it into a string we can display
 void DisplayTime()
 {
-  if (!hasWiFi)
-  {
-    DisplayText("NO CLOCK");
-    return;
-  }
   // Store the current time into a struct
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo))
   {
     Serial.println("Failed to obtain time");
-    DisplayText("TIME FAILED");
     return;
   }
-  // Formt the contents of the time struct into a string for display
+  // Format the contents of the time struct into a string for display
   char DateAndTimeString[12];
-  String sep = clockSeparators[settings_separator];
-  if ( timeinfo.tm_hour < 10 )
-    sprintf(DateAndTimeString, "   %d%s%02d%s%02d", timeinfo.tm_hour, sep, timeinfo.tm_min, sep, timeinfo.tm_sec);
-  else
-    sprintf(DateAndTimeString, "  %d%s%02d%s%02d", timeinfo.tm_hour, sep, timeinfo.tm_min, sep, timeinfo.tm_sec);
+  // if ( timeinfo.tm_hour < 10 )
+  //   sprintf(DateAndTimeString, "   %d %02d %02d", timeinfo.tm_hour,timeinfo.tm_min,timeinfo.tm_sec);
+  // else
+
+  // CableTie 2020-07-25
+  // - \0x17 is a modified character in the Adafruit font for a ^ using the bottom two segments (L and N)
+  // - Gonna revisit this - might end up leaving it as a space character
+  sprintf(DateAndTimeString, "  %02d%c%02d%c%02d", timeinfo.tm_hour, timeSeparator, timeinfo.tm_min, timeSeparator, timeinfo.tm_sec);
+
+  // This maybe should be replaced with a call to DisplayText()
+  // - need to make DateAndTimeString a String instead of a char* */
 
   // Iterate through each digit on the display and populate the time, or clear the digit
   uint8_t curDisplay = 0;
   uint8_t curDigit = 0;
 
-  for ( uint8_t i = 0; i < 10; i++ )
+  for (uint8_t i = 0; i < 10; i++)
   {
-    matrix[curDisplay].writeDigitAscii( curDigit, DateAndTimeString[i]);
+    matrix[curDisplay].writeDigitAscii(curDigit, DateAndTimeString[i]);
     curDigit++;
-    if ( curDigit == 4 )
+    if (curDigit == 4)
     {
       curDigit = 0;
       curDisplay++;
@@ -604,12 +636,12 @@ void DisplayText(String txt)
 
   Clear();
 
-  // Iterate through each digit and push the character rom the txt string into that position
-  for ( uint8_t i = 0; i < txt.length(); i++ )
+  // Iterate through each digit and push the character from the txt string into that position
+  for (uint8_t i = 0; i < txt.length(); i++)
   {
-    matrix[curDisplay].writeDigitAscii( curDigit, txt.charAt(i));
+    matrix[curDisplay].writeDigitAscii(curDigit, txt.charAt(i));
     curDigit++;
-    if ( curDigit == 4 )
+    if (curDigit == 4)
     {
       curDigit = 0;
       curDisplay++;
@@ -620,11 +652,10 @@ void DisplayText(String txt)
   Display();
 }
 
-
 // Return a random time step for the next solving solution
 uint16_t GetNextSolveStep()
 {
-  return random( solveStepMin, solveStepMax ) * solveStepMulti;
+  return random(solveStepMin, solveStepMax) * solveStepMulti;
 }
 
 // Fill whatever is in the code buffer into the display buffer
@@ -635,20 +666,20 @@ void FillCodes()
   char c = 0;
   char c_code = 0;
 
-  for ( int i = 0; i < 12; i++ )
+  for (int i = 0; i < 12; i++)
   {
     c = displaybuffer[i];
     c_code = missile_code[i];
-    if ( c == '-' )
+    if (c == '-')
     {
       // c is a character we need to randomise
-      c = random( 48, 91 );
-      while ( ( c > 57 && c < 65 ) || c == c_code )
-        c = random( 48, 91 );
+      c = random(48, 91);
+      while ((c > 57 && c < 65) || c == c_code)
+        c = random(48, 91);
     }
-    matrix[matrix_index].writeDigitAscii( character_index, c );
+    matrix[matrix_index].writeDigitAscii(character_index, c);
     character_index++;
-    if ( character_index == 4 )
+    if (character_index == 4)
     {
       character_index = 0;
       matrix_index++;
@@ -662,10 +693,10 @@ void FillCodes()
 // Randomise the order of the code being solved
 void RandomiseSolveOrder()
 {
-  for ( uint8_t i = 0; i < 12; i++ )
+  for (uint8_t i = 0; i < 12; i++)
   {
     uint8_t ind = random(0, 12);
-    while ( code_solve_order_random[ind] < 99 )
+    while (code_solve_order_random[ind] < 99)
       ind = random(0, 12);
 
     code_solve_order_random[ind] = i;
@@ -675,14 +706,14 @@ void RandomiseSolveOrder()
 // Reset the code being solved back to it's starting state
 void ResetCode()
 {
-  if ( currentMode == MOVIE )
+  if (currentMode == MODEMOVIE)
   {
     solveStepMulti = 1;
-    solveCountFinished  = 10;
-    for ( uint8_t i = 0; i < 12; i++ )
+    solveCountFinished = 10;
+    for (uint8_t i = 0; i < 12; i++)
       missile_code[i] = missile_code_movie[i];
   }
-  else if ( currentMode == RANDOM )
+  else if (currentMode == MODERANDOM)
   {
     solveStepMulti = 0.5;
 
@@ -692,24 +723,23 @@ void ResetCode()
     // Set the code length and populate the code with random chars
     solveCountFinished = 12;
 
-    for ( uint8_t i = 0; i < 12; i++ )
+    for (uint8_t i = 0; i < 12; i++)
     {
       Serial.print("Setting code index ");
       Serial.print(i);
 
       // c is a character we need to randomise
-      char c = random( 48, 91 );
-      while ( c > 57 && c < 65 )
-        c = random( 48, 91 );
-
+      char c = random(48, 91);
+      while (c > 57 && c < 65)
+        c = random(48, 91);
 
       Serial.print(" to char ");
-      Serial.println( c );
+      Serial.println(c);
 
       missile_code[i] = c;
     }
   }
-  else if ( currentMode == MESSAGE )
+  else if (currentMode == MODEMESSAGE)
   {
     solveStepMulti = 0.5;
 
@@ -718,7 +748,7 @@ void ResetCode()
 
     // Set the code length and populate the code with the stored message
     solveCountFinished = 12;
-    for ( uint8_t i = 0; i < 12; i++ )
+    for (uint8_t i = 0; i < 12; i++)
       missile_code[i] = missile_code_message[i];
   }
 
@@ -730,47 +760,47 @@ void ResetCode()
   lastDefconLevel = 0;
 
   // Clear code display buffer
-  for ( uint8_t i = 0; i < 12; i++ )
+  for (uint8_t i = 0; i < 12; i++)
   {
-    if ( currentMode == 0 && ( i == 3 || i == 8 ) )
-      displaybuffer[ i ] = ' ';
+    if (currentMode == MODEMOVIE && (i == 3 || i == 8))
+      displaybuffer[i] = ' ';
     else
-      displaybuffer[ i ] = '-';
+      displaybuffer[i] = '-';
   }
 }
 
 /*  Solve the code based on the order of the solver for the current mode
-    This is fake of course, but so was the film!
-    The reason we solve based on a solver order, is so we can solve the code
-    in the order it was solved in the movie.
-*/
+ *  This is fake of course, but so was the film!
+ *  The reason we solve based on a solver order, is so we can solve the code 
+ *  in the order it was solved in the movie.
+ */
 
 void SolveCode()
 {
   // If the number of digits solved is less than the number to be solved
-  if ( solveCount < solveCountFinished )
+  if (solveCount < solveCountFinished)
   {
     // Grab the next digit from the code based on the mode
     uint8_t index = 0;
 
-    if ( currentMode == MOVIE )
+    if (currentMode == MODEMOVIE)
     {
-      index = code_solve_order_movie[ solveCount ];
-      displaybuffer[ index ] = missile_code[ index ];
+      index = code_solve_order_movie[solveCount];
+      displaybuffer[index] = missile_code[index];
     }
     else
     {
-      index = code_solve_order_random[ solveCount ];
-      displaybuffer[ index ] = missile_code[ index ];
+      index = code_solve_order_random[solveCount];
+      displaybuffer[index] = missile_code[index];
     }
 
-    Serial.println("Found " + String(displaybuffer[ index ]) + " @ index: " + String(solveCount));
+    Serial.println("Found " + String(displaybuffer[index]) + " @ index: " + String(solveCount));
 
     // move tghe solver to the next digit of the code
     solveCount++;
 
     // Get current percentage of code solved so we can set the defcon display
-    float solved = 1 - ( (float)solveCount / (float)solveCountFinished);
+    float solved = 1 - ((float)solveCount / (float)solveCountFinished);
 
     Serial.println("Solved " + String(solved));
 
@@ -784,22 +814,22 @@ void SolveCode()
     FillCodes();
 
     // Long beep to indicate a digit in he code has been solved!
-    ledcWriteTone(channel, 1500 );
+    ledcWriteTone(channel, 1500);
     beeping = true;
     beepCount = 3;
     nextBeep = millis() + 500;
   }
 }
 
-// Clear the contents of the display buffers and update the display
+// Clear the contents of the 16 segment LED display buffers and update the display
 void Clear()
 {
   // There are 3 LED drivers
-  for ( int i = 0; i < 3; i++ )
+  for (int i = 0; i < 3; i++)
   {
     // There are 4 digits per LED driver
-    for ( int d = 0; d < 4; d++ )
-      matrix[i].writeDigitAscii( d, ' ');
+    for (int d = 0; d < 4; d++)
+      matrix[i].writeDigitAscii(d, ' ');
 
     matrix[i].writeDisplay();
   }
@@ -808,15 +838,15 @@ void Clear()
 // Show the contents of the display buffer on the displays
 void Display()
 {
-  for ( int i = 0; i < 3; i++ )
+  for (int i = 0; i < 3; i++)
     matrix[i].writeDisplay();
 }
 
-void RGB_SetDefcon( byte level, bool force )
+void RGB_SetDefcon(byte level, bool force)
 {
   // Only update the defcon display if the value has changed
   // to prevent flickering
-  if ( lastDefconLevel != level || force )
+  if (lastDefconLevel != level || force)
   {
     lastDefconLevel = level;
 
@@ -833,12 +863,12 @@ void RGB_SetDefcon( byte level, bool force )
 
 void RGB_Rainbow(int wait)
 {
-  if ( nextRGB < millis() )
+  if (nextRGB < millis())
   {
     nextRGB = millis() + wait;
     nextPixelHue += 256;
 
-    if ( nextPixelHue > 65536 )
+    if (nextPixelHue > 65536)
       nextPixelHue = 0;
 
     // For each RGB LED
@@ -852,76 +882,77 @@ void RGB_Rainbow(int wait)
   }
 }
 
-int pingpong(int t, int length)
-{
-  return t % length;
-}
-
-
-void RGB_SetColor_ALL(uint32_t col)
-{
-  // For each RGB LED
-  for (int i = 0; i < 5; i++)
-    leds[i] = col;
-
-  // Update RGB LEDs
-  RGB_FillBuffer();
-}
-
 void loop()
 {
   // Used by OneButton to poll for button inputs
   Button1.tick();
   Button2.tick();
-#ifdef HAXORZ_EDITION
-  Button3.tick();
-  Button4.tick();
-#endif
 
   // We are in the menu
-  if ( currentState == MENU )
+  if (currentState == STATEMENU)
   {
     // We dont need to do anything here, but lets show some fancy RGB!
     RGB_Rainbow(10);
-
-    // Timer to go into clock if no user interaction for XX seconds
-    // If settings_clockCountdownTime is 0, this feature is off
-    if ( hasWiFi && settings_clockCountdownTime > 0 && countdownToClock < millis()  )
+    // Determine timout to go to clock if in menu mode for too long
+    if (menuTimeoutMillis < millis())
     {
-      Clear();
-      currentMode = CLOCK;
-      currentState = RUNNING;
+      // Menu timout, go to default mode
+      currentState = STATERUN;   // Running
+      currentMode = defaultMode; // whatever is set as default mode, usually clock
+      setupCurrentMode();
+
+      // And report it
+      Serial.print("Menu timout --> ");
+      Serial.print(modeNames[currentMode]);
+      Serial.println(" mode");
     }
   }
-  // We are running a simulation
-  else if ( currentState == SET )
+  else if (currentState == STATESET)
   {
-
-
   }
+  // We are in run mode
   else
   {
-    if ( currentMode == 3 )
+    if (currentMode == MODECLOCK) // Clock
     {
-      if ( nextBeep < millis() )
+      if (nextBeep < millis())
       {
         DisplayTime();
         nextBeep = millis() + 1000;
       }
+      RGB_Rainbow(10);
+    }
+    // Setup mode where b1 and b2 increment and decrement the value
+    else if (currentMode == MODESETUP) // Setup
+    {
+      if (nextTick < millis())
+      {
+        nextTick = millis() + tickStep;
+        if (ledFlash)
+          sprintf(displaybuffer, "%s %s", settingNames[currentSetting], GetCurrentSettingValueString());
+        else
+          sprintf(displaybuffer, "%s", settingNames[currentSetting], GetCurrentSettingValueString());
+        DisplayText(displaybuffer);
+        RGB_SetDefcon(1, false);
+      }
+    }
+    else if (currentMode == MODETICKER)
+    {
+      // ToDo Scroll Ticker message across the LED display
     }
     else
     {
-      // We have solved the code
-      if ( solveCount == solveCountFinished )
+      // If we have solved the code
+      if (solveCount == solveCountFinished)
       {
-        if ( nextBeep < millis() )
+        if (nextBeep < millis())
         {
           beeping = !beeping;
           nextBeep = millis() + 500;
 
-          if ( beeping )
+          if (beeping)
           {
-            if ( beepCount > 0 )
+            if (beepCount > 0)
             {
               RGB_SetDefcon(1, true);
               FillCodes();
@@ -932,13 +963,23 @@ void loop()
             {
               RGB_SetDefcon(1, true);
               DisplayText("LAUNCHING...");
+              // Test return to clock timeout
+              if (menuTimeoutMillis < millis())
+              {
+                currentMode = defaultMode;
+                setupCurrentMode();
+                // And report it
+                Serial.print("Menu timout --> ");
+                Serial.print(modeNames[currentMode]);
+                Serial.println(" mode");
+              }
             }
           }
           else
           {
             Clear();
             RGB_Clear(true);
-            ledcWriteTone(channel, 0 );
+            ledcWriteTone(channel, 0);
           }
         }
 
@@ -946,22 +987,25 @@ void loop()
         return;
       }
 
+      // Pat the menu timeout watchdog timer
+      menuTimeoutMillis = millis() + S2MS(menuTimeout);
+
       // Only update the displays every "tickStep"
-      if ( nextTick < millis() )
+      if (nextTick < millis())
       {
         nextTick = millis() + tickStep;
 
-        // This displays whatever the current state of the display is
+        // This displays whatever teh current state of the display is
         FillCodes();
 
         // If we are not currently beeping, play some random beep/bop computer-y sounds
-        if ( !beeping )
+        if (!beeping)
           ledcWriteTone(channel, random(90, 250));
       }
 
       // This is where we solve each code digit
       // The next solve step is a random length to make it take a different time every run
-      if ( nextSolve < millis() )
+      if (nextSolve < millis())
       {
         nextSolve = millis() + solveStep;
         // Set the solve time step to a random length
@@ -971,9 +1015,9 @@ void loop()
       }
 
       // Zturn off any beeping if it's trying to beep
-      if ( beeping )
+      if (beeping)
       {
-        if ( nextBeep < millis() )
+        if (nextBeep < millis())
         {
           ledcWriteTone(channel, 0);
           beeping = false;
@@ -981,55 +1025,4 @@ void loop()
       }
     }
   }
-}
-
-// File/Settings Stuff
-void loadSettings()
-{
-  ESPFlash<uint8_t> set_ClockCountdown("/set_ClockCountdown");
-  int leng = set_ClockCountdown.length();
-
-  // If the clock countdown is 0, then no data exists
-  // So we wil create the defaults and reload
-  if ( leng == 0 )
-  {
-    Serial.println("**** Creating settings!!!");
-    saveSettings();
-    loadSettings();
-    return;
-  }
-  Clear();
-
-//  ESPFlash<uint8_t> set_ClockCountdown("/set_ClockCountdown");
-  settings_clockCountdownTime = set_ClockCountdown.get();
-  
-  ESPFlash<uint8_t> set_Separator("/set_Separator");
-  settings_separator = constrain(set_Separator.get(), 0, ELEMENTS(clockSeparators) - 1);
-
-  ESPFlash<int> set_GMT("/set_GMT");
-  settings_GMT = set_GMT.get();
-
-  ESPFlash<int> set_DST("/set_DST");
-  settings_DST = set_DST.get() == 1;
-
-  ESPFlash<uint8_t> set_Brightness("/set_Brightness");
-  settings_displayBrightness = set_Brightness.get();
-}
-
-void saveSettings()
-{
-  ESPFlash<int> set_GMT("/set_GMT");
-  set_GMT.set(settings_GMT);
-
-  ESPFlash<int> set_DST("/set_DST");
-  set_DST.set(settings_DST ? 1 : 0);
-
-  ESPFlash<uint8_t> set_ClockCountdown("/set_ClockCountdown");
-  set_ClockCountdown.set(settings_clockCountdownTime);
-
-  ESPFlash<uint8_t> set_Separator("/set_Separator");
-  set_Separator.set(settings_separator);
-
-  ESPFlash<uint8_t> set_Brightness("/set_Brightness");
-  set_Brightness.set(settings_displayBrightness);
 }
