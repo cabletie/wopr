@@ -30,7 +30,7 @@
 // #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>         // From Library Manager
-#include "Adafruit_LEDBackpack.h" // From Library Manager
+#include <Adafruit_LEDBackpack.h> // From Library Manager
 #include "OneButton.h"            // From Library Manager
 #include <WiFi.h>
 #include <time.h>
@@ -38,6 +38,7 @@
 #include "rmt.h"
 #include "ESP32TimerInterrupt.h"
 #include <Preferences.h>
+#include <PubSubClient.h>
 
 // Defines
 #ifndef _BV
@@ -176,9 +177,65 @@ uint8_t code_solve_order_movie[10] = {7, 1, 4, 6, 11, 2, 5, 0, 10, 9}; // 4 P 1 
 
 uint8_t code_solve_order_random[12] = {99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99};
 
+// Storage and default for the current ticker message
+char tickerMessage[256] = "WOPR by UnexpectedMaker";
+
 // Initialise the buttons using OneButton library
 OneButton Button1(BUT1, false);
 OneButton Button2(BUT2, false);
+
+// MQTT
+// Add your MQTT Broker IP address, example:
+//const char* mqtt_server = "192.168.1.144";
+const char* mqtt_server = "192.168.86.87";
+
+PubSubClient client(WiFiClass);
+long lastMsg = 0;
+char msg[256];
+int value = 0;
+
+// MQTT callback function
+void mqttCallback(char* topic, byte* message, unsigned int length) {
+  Serial.print("Message arrived on topic: ");
+  Serial.print(topic);
+  Serial.print(". Message: ");
+  String messageTemp;
+  
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)message[i]);
+    messageTemp += (char)message[i];
+  }
+  Serial.println();
+
+  // Feel free to add more if statements to control more GPIOs with MQTT
+
+  // If a message is received on the topic esp32/output, you check if the message is either "on" or "off". 
+  // Changes the output state according to the message
+  if (String(topic) == "wopr/ticker") {
+    Serial.print("Changing ticker string to ");
+    Serial.println(messageTemp);
+    strncpy(tickerMessage,(char *)message,length);
+  }
+}
+
+void mqttReconnect() {
+  // Loop until we're reconnected
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    // Attempt to connect
+    if (client.connect("WOPRClient")) {
+      Serial.println("connected");
+      // Subscribe
+      client.subscribe("wopr/ticker");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      // Wait 5 seconds before retrying
+      delay(5000);
+    }
+  }
+}
 
 void setup()
 {
@@ -259,6 +316,11 @@ void setup()
   // Display MENU and Initialise timeout
   DisplayText("MENU");
   menuTimeoutMillis = millis() + S2MS(menuTimeout);
+
+  // Configure MQTT
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
+
 }
 
 // Timer callback to flash settings number
@@ -880,6 +942,7 @@ void RGB_Rainbow(int wait)
     // Update RGB LEDs
     RGB_FillBuffer();
   }
+  mqttReconnect();
 }
 
 void loop()
@@ -887,6 +950,12 @@ void loop()
   // Used by OneButton to poll for button inputs
   Button1.tick();
   Button2.tick();
+
+  // Check for MQTT
+  if (!client.connected()) {
+    mqttReconnect();
+  }
+  client.loop();
 
   // We are in the menu
   if (currentState == STATEMENU)
@@ -938,6 +1007,7 @@ void loop()
     }
     else if (currentMode == MODETICKER)
     {
+      DisplayText(tickerMessage)
       // ToDo Scroll Ticker message across the LED display
     }
     else
