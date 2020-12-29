@@ -29,8 +29,8 @@
 // #define ARDUINO 100
 // #include <Arduino.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>         // From Library Manager
-#include <Adafruit_LEDBackpack.h> // From Library Manager
+#include "Adafruit_GFX.h"         // From Library Manager
+#include "Adafruit_LEDBackpack.h" // From Library Manager
 #include "OneButton.h"            // From Library Manager
 #include <WiFi.h>
 #include <time.h>
@@ -189,7 +189,8 @@ OneButton Button2(BUT2, false);
 //const char* mqtt_server = "192.168.1.144";
 const char* mqtt_server = "192.168.86.87";
 
-PubSubClient client(WiFiClass);
+WiFiClient wifi_client;
+PubSubClient mqtt_client(wifi_client);
 long lastMsg = 0;
 char msg[256];
 int value = 0;
@@ -220,16 +221,16 @@ void mqttCallback(char* topic, byte* message, unsigned int length) {
 
 void mqttReconnect() {
   // Loop until we're reconnected
-  while (!client.connected()) {
+  while (!mqtt_client.connected()) {
     Serial.print("Attempting MQTT connection...");
     // Attempt to connect
-    if (client.connect("WOPRClient")) {
+    if (mqtt_client.connect("WOPRClient",mqtt_user,mqtt_pass)) {
       Serial.println("connected");
       // Subscribe
-      client.subscribe("wopr/ticker");
+      mqtt_client.subscribe("wopr/ticker");
     } else {
       Serial.print("failed, rc=");
-      Serial.print(client.state());
+      Serial.print(mqtt_client.state());
       Serial.println(" try again in 5 seconds");
       // Wait 5 seconds before retrying
       delay(5000);
@@ -318,8 +319,8 @@ void setup()
   menuTimeoutMillis = millis() + S2MS(menuTimeout);
 
   // Configure MQTT
-  client.setServer(mqtt_server, 1883);
-  client.setCallback(callback);
+  mqtt_client.setServer(mqtt_server, 1883);
+  mqtt_client.setCallback(mqttCallback);
 
 }
 
@@ -469,8 +470,8 @@ void StartWifi()
   Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
 
   //disconnect WiFi as it's no longer needed
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
+  // WiFi.disconnect(true);
+  // WiFi.mode(WIFI_OFF);
 }
 
 // Button press code her
@@ -952,10 +953,10 @@ void loop()
   Button2.tick();
 
   // Check for MQTT
-  if (!client.connected()) {
+  if (!mqtt_client.connected()) {
     mqttReconnect();
   }
-  client.loop();
+  mqtt_client.loop();
 
   // We are in the menu
   if (currentState == STATEMENU)
@@ -1007,7 +1008,7 @@ void loop()
     }
     else if (currentMode == MODETICKER)
     {
-      DisplayText(tickerMessage)
+      DisplayText(tickerMessage);
       // ToDo Scroll Ticker message across the LED display
     }
     else
