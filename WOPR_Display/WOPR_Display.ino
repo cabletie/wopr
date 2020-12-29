@@ -178,7 +178,19 @@ uint8_t code_solve_order_movie[10] = {7, 1, 4, 6, 11, 2, 5, 0, 10, 9}; // 4 P 1 
 uint8_t code_solve_order_random[12] = {99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99};
 
 // Storage and default for the current ticker message
-char tickerMessage[256] = "WOPR by UnexpectedMaker";
+char ticker_message[256] = "WOPR by UnexpectedMaker";
+
+// Buffer to be displayed on the LEDs
+char led_buffer[13] = "            ";
+
+// string length of current message to display
+size_t ticker_message_length = strlen(ticker_message);
+
+// Size of LED buffer + current message
+size_t icstsize = ticker_message_length + sizeof(led_buffer)-1u;
+
+// Current position in message
+size_t position = 0;
 
 // Initialise the buttons using OneButton library
 OneButton Button1(BUT1, false);
@@ -213,9 +225,25 @@ void mqttCallback(char* topic, byte* message, unsigned int length) {
   // If a message is received on the topic esp32/output, you check if the message is either "on" or "off". 
   // Changes the output state according to the message
   if (String(topic) == "wopr/ticker") {
-    Serial.print("Changing ticker string to ");
-    Serial.println(messageTemp);
-    strncpy(tickerMessage,(char *)message,length);
+    Serial.print("Changing ticker string to '");
+    Serial.print(messageTemp);
+    Serial.print("' ");
+
+    // Copy the message to the ticker message buffer, padding with zeroes.
+    strncpy(ticker_message,(char *)message,sizeof(ticker_message));
+    ticker_message[length] = '\0';
+    // Serial.printf("[%s]",strlen(ticker_message));
+
+    // Set the actual message length
+    ticker_message_length = strlen(ticker_message);
+
+    // Reset where we are up to in the message
+    position = 0;
+
+    // Clear the buffer to be written to the LEDs
+    memset(led_buffer,' ',sizeof(led_buffer)-1u);
+
+    // 
   }
 }
 
@@ -1008,8 +1036,24 @@ void loop()
     }
     else if (currentMode == MODETICKER)
     {
-      DisplayText(tickerMessage);
-      // ToDo Scroll Ticker message across the LED display
+      // 
+      icstsize = ticker_message_length + sizeof(led_buffer)-1u;
+
+      // while (1)
+      // {
+        // shift the buffer
+        for (size_t i = 0u; i < (sizeof(led_buffer) - 1u); i++)
+                led_buffer[i] = led_buffer[i + 1u];
+
+        // fill in the last character
+        led_buffer[sizeof(led_buffer) - 1u] = position < ticker_message_length ? ticker_message[position] : ' ';
+        // increment the position in the imaginary circular source text
+        position = (position + 1u) % icstsize;
+        Serial.printf("[%.*s] \r", (int)sizeof(led_buffer)-1u, led_buffer);
+        DisplayText(led_buffer);
+        delay(200);
+        // usleep(500000);
+      // }
     }
     else
     {
